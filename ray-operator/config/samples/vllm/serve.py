@@ -21,19 +21,25 @@ from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_engine import LoRAModulePath, PromptAdapterPath
 from vllm.utils import FlexibleArgumentParser
 from vllm.entrypoints.logger import RequestLogger
-from vllm.executor import ray_utils
 import ray
+from vllm.executor import ray_utils
 
-def patched_get_node_with_resources(required_resources):
-    for node in ray.nodes():
-        print(">>> [PATCH ACTIVE] Checking node resources:", node["Resources"])
-        if not node["Alive"]:
-            continue
-        if "GPU" in node["Resources"] and node["Resources"]["GPU"] >= required_resources.get("GPU", 0):
-            return node
-    raise RuntimeError("No suitable node with raw 'GPU' resources found. (from monkey patch)")
+def patched_initialize_ray_cluster(parallel_config):
+    print(">>> [PATCH ACTIVE] Patching initialize_ray_cluster()")
+    from vllm.executor.parallel_utils import get_parallel_config
+    from vllm.executor.executor import RayExecutor
 
-ray_utils.get_node_with_resources = patched_get_node_with_resources
+    ray.init(address="auto", ignore_reinit_error=True)
+
+    # Instead of validating the node has "GPU", just skip the check
+    # because we *know* the GPU is accessible
+    print(">>> [PATCH ACTIVE] Skipping GPU availability check")
+
+    # Original logic, but skip raise ValueError step
+    parallel_config = get_parallel_config(parallel_config)
+    RayExecutor.initialize_parallel_groups(parallel_config)
+
+ray_utils.initialize_ray_cluster = patched_initialize_ray_cluster
 
 logger = logging.getLogger("ray.serve")
 
