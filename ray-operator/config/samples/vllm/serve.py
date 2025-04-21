@@ -42,6 +42,20 @@ def patched_ray_nodes():
     return nodes
 
 ray.nodes = patched_ray_nodes
+_original_available_resources = ray.available_resources
+
+def patched_available_resources():
+    resources = _original_available_resources()
+    # Only patch if 'GPU' is missing but groups exist
+    if "GPU" not in resources:
+        grouped_gpu_keys = [k for k in resources if k.startswith("GPU_group")]
+        total_gpus = sum(resources[k] for k in grouped_gpu_keys)
+        if total_gpus > 0:
+            resources["GPU"] = total_gpus
+            print(f">>> [FAKE GPU PATCH] Injected 'GPU': {total_gpus} in available_resources()")
+    return resources
+
+ray.available_resources = patched_available_resources
 
 logger = logging.getLogger("ray.serve")
 
