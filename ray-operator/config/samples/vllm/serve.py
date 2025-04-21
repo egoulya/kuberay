@@ -25,8 +25,19 @@ from vllm.executor import ray_utils
 
 logger = logging.getLogger("ray.serve")
 
-app = FastAPI()
+def patched_get_node_with_resources(required_resources):
+    import ray
+    for node in ray.nodes():
+        if not node["Alive"]:
+            continue
+        # Check if node has un-namespaced "GPU"
+        if "GPU" in node["Resources"] and node["Resources"]["GPU"] >= required_resources.get("GPU", 0):
+            return node
+    raise RuntimeError("No suitable node with raw 'GPU' resources found.")
 
+ray_utils.get_node_with_resources = patched_get_node_with_resources
+
+app = FastAPI()
 
 @serve.deployment(name="VLLMDeployment")
 @serve.ingress(app)
@@ -48,7 +59,6 @@ class VLLMDeployment:
         self.prompt_adapters = prompt_adapters
         self.request_logger = request_logger
         self.chat_template = chat_template
-        ray_utils.get_node_with_resources = patched_get_node_with_resources
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     @app.post("/v1/chat/completions")
@@ -90,16 +100,6 @@ class VLLMDeployment:
         else:
             assert isinstance(generator, ChatCompletionResponse)
             return JSONResponse(content=generator.model_dump())
-
-def patched_get_node_with_resources(required_resources):
-    import ray
-    for node in ray.nodes():
-        if not node["Alive"]:
-            continue
-        # Check if node has un-namespaced "GPU"
-        if "GPU" in node["Resources"] and node["Resources"]["GPU"] >= required_resources.get("GPU", 0):
-            return node
-    raise RuntimeError("No suitable node with raw 'GPU' resources found.")
     
 def parse_vllm_args(cli_args: Dict[str, str]):
     """Parses vLLM args based on CLI inputs.
