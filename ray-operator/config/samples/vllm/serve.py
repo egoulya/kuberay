@@ -22,6 +22,18 @@ from vllm.entrypoints.openai.serving_engine import LoRAModulePath, PromptAdapter
 from vllm.utils import FlexibleArgumentParser
 from vllm.entrypoints.logger import RequestLogger
 from vllm.executor import ray_utils
+import ray
+
+def patched_get_node_with_resources(required_resources):
+    for node in ray.nodes():
+        print(">>> [PATCH ACTIVE] Checking node resources:", node["Resources"])
+        if not node["Alive"]:
+            continue
+        if "GPU" in node["Resources"] and node["Resources"]["GPU"] >= required_resources.get("GPU", 0):
+            return node
+    raise RuntimeError("No suitable node with raw 'GPU' resources found. (from monkey patch)")
+
+ray_utils.get_node_with_resources = patched_get_node_with_resources
 
 logger = logging.getLogger("ray.serve")
 
@@ -40,18 +52,6 @@ class VLLMDeployment:
         chat_template: Optional[str] = None,
     ):
         logger.info(f"Starting with engine args: {engine_args}")
-        def patched_get_node_with_resources(required_resources):
-            import ray
-            for node in ray.nodes():
-                print(">>> [PATCH ACTIVE] Checking node resources:", node["Resources"])
-                if not node["Alive"]:
-                    continue
-                # Check if node has un-namespaced "GPU"
-                if "GPU" in node["Resources"] and node["Resources"]["GPU"] >= required_resources.get("GPU", 0):
-                    return node
-            raise RuntimeError("No suitable node with raw 'GPU' resources found.")
-
-        ray_utils.get_node_with_resources = patched_get_node_with_resources
         self.openai_serving_chat = None
         self.engine_args = engine_args
         self.response_role = response_role
