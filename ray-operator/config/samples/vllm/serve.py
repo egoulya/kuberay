@@ -38,7 +38,6 @@ def patched_available_resources():
             print(f">>> [FAKE GPU PATCH] Injected GPU={fake_gpu} in available_resources()")
     return resources
 
-ray.nodes = patched_ray_nodes
 ray.available_resources = patched_available_resources
 
 # Monkey-patch vLLM's GPU check in initialize_ray_cluster
