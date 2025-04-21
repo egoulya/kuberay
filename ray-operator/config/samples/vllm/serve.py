@@ -24,22 +24,24 @@ from vllm.entrypoints.logger import RequestLogger
 import ray
 from vllm.executor import ray_utils
 
-def patched_initialize_ray_cluster(parallel_config):
-    print(">>> [PATCH ACTIVE] Patching initialize_ray_cluster()")
-    from vllm.executor.parallel_utils import get_parallel_config
-    from vllm.executor.executor import RayExecutor
+_original_ray_nodes = ray.nodes
 
-    ray.init(address="auto", ignore_reinit_error=True)
+def patched_ray_nodes():
+    nodes = _original_ray_nodes()
+    for node in nodes:
+        if node.get("Alive", False):
+            resources = node["Resources"]
+            # If raw "GPU" not present but grouped GPUs are
+            if "GPU" not in resources:
+                # Check for grouped GPU resources and sum them
+                grouped_gpu_keys = [k for k in resources if k.startswith("GPU_group")]
+                total_fake_gpus = sum(resources[k] for k in grouped_gpu_keys)
+                if total_fake_gpus > 0:
+                    resources["GPU"] = total_fake_gpus
+                    print(f">>> [FAKE GPU PATCH] Injected 'GPU': {total_fake_gpus} on node {node['NodeManagerAddress']}")
+    return nodes
 
-    # Instead of validating the node has "GPU", just skip the check
-    # because we *know* the GPU is accessible
-    print(">>> [PATCH ACTIVE] Skipping GPU availability check")
-
-    # Original logic, but skip raise ValueError step
-    parallel_config = get_parallel_config(parallel_config)
-    RayExecutor.initialize_parallel_groups(parallel_config)
-
-ray_utils.initialize_ray_cluster = patched_initialize_ray_cluster
+ray.nodes = patched_ray_nodes
 
 logger = logging.getLogger("ray.serve")
 
