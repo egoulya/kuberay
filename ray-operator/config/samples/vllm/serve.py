@@ -7,21 +7,26 @@ import ray
 from ray import serve
 
 # Monkey-patch: Make Ray think GPUs exist even if not labeled "GPU"
-_original_ray_nodes = ray.nodes
 _original_available_resources = ray.available_resources
 
-def patched_ray_nodes():
-    nodes = _original_ray_nodes()
+import ray._private.state as ray_state
+
+_original_nodes = ray_state.nodes
+
+def patched_ray_state_nodes(*args, **kwargs):
+    nodes = _original_nodes(*args, **kwargs)
     for node in nodes:
         if node.get("Alive", False):
             resources = node["Resources"]
             if "GPU" not in resources:
-                grouped = [k for k in resources if k.startswith("GPU_group")]
-                fake_gpu = sum(resources[k] for k in grouped)
-                if fake_gpu > 0:
-                    resources["GPU"] = fake_gpu
-                    print(f">>> [FAKE GPU PATCH] Injected GPU={fake_gpu} on {node['NodeManagerAddress']}")
+                grouped_gpu_keys = [k for k in resources if k.startswith("GPU_group")]
+                total_gpus = sum(resources[k] for k in grouped_gpu_keys)
+                if total_gpus > 0:
+                    resources["GPU"] = total_gpus
+                    print(f">>> [FAKE GPU PATCH] Injected 'GPU': {total_gpus} in ray._private.state.nodes() for node {node['NodeManagerAddress']}")
     return nodes
+
+ray_state.nodes = patched_ray_state_nodes
 
 def patched_available_resources():
     resources = _original_available_resources()
