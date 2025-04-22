@@ -6,13 +6,34 @@ from typing import Dict, Optional, List
 import ray
 from ray import serve
 from vllm.executor import ray_utils
-import ray._private.state as ray_state
 
 # Monkey-patch: Make Ray think GPUs exist even if not labeled "GPU"
 _original_available_resources = ray.available_resources
 _original_nodes = ray_state.nodes
 _original_init_cluster = ray_utils.initialize_ray_cluster
-_original_node_resources = ray_state.node_resources
+
+try:
+    import ray._private.state as ray_state
+
+    if hasattr(ray_state, "node_resources"):
+        _original_node_resources = ray_state.node_resources
+
+        def patched_node_resources(node_id: Optional[str] = None):
+            resources = _original_node_resources(node_id)
+            if "GPU" not in resources:
+                grouped = [k for k in resources if k.startswith("GPU_group")]
+                fake_gpu = sum(resources[k] for k in grouped)
+                if fake_gpu > 0:
+                    resources["GPU"] = fake_gpu
+                    print(f">>> [FAKE GPU PATCH] Injected 'GPU': {fake_gpu} in ray_state.node_resources() for node {node_id}")
+            return resources
+
+        ray_state.node_resources = patched_node_resources
+    else:
+        print(">>> [WARNING] ray_state.node_resources not found in this Ray version; skipping patch.")
+
+except ImportError:
+    print(">>> [WARNING] ray._private.state not available; skipping node_resources patch.")
 
 def patched_available_resources():
     resources = _original_available_resources()
@@ -33,20 +54,8 @@ def patched_initialize_ray_cluster(parallel_config):
     parallel_config = get_parallel_config(parallel_config)
     RayExecutor.initialize_parallel_groups(parallel_config)
 
-def patched_node_resources(node_id: Optional[str] = None):
-    resources = _original_node_resources(node_id)
-    if "GPU" not in resources:
-        grouped = [k for k in resources if k.startswith("GPU_group")]
-        fake_gpu = sum(resources[k] for k in grouped)
-        if fake_gpu > 0:
-            resources["GPU"] = fake_gpu
-            print(f">>> [FAKE GPU PATCH] Injected 'GPU': {fake_gpu} in ray_state.node_resources() for node {node_id}")
-    return resources
-
-
 ray.available_resources = patched_available_resources
 ray_utils.initialize_ray_cluster = patched_initialize_ray_cluster
-ray_state.node_resources = patched_node_resources
 
 import os
 
