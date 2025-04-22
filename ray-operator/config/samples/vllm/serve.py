@@ -5,28 +5,14 @@ from typing import Dict, Optional, List
 # Apply monkey-patches BEFORE importing vLLM!
 import ray
 from ray import serve
+from vllm.executor import ray_utils
+import ray._private.state as ray_state
 
 # Monkey-patch: Make Ray think GPUs exist even if not labeled "GPU"
 _original_available_resources = ray.available_resources
-
-import ray._private.state as ray_state
-
 _original_nodes = ray_state.nodes
-
-def patched_ray_state_nodes(*args, **kwargs):
-    nodes = _original_nodes(*args, **kwargs)
-    for node in nodes:
-        if node.get("Alive", False):
-            resources = node["Resources"]
-            if "GPU" not in resources:
-                grouped_gpu_keys = [k for k in resources if k.startswith("GPU_group")]
-                total_gpus = sum(resources[k] for k in grouped_gpu_keys)
-                if total_gpus > 0:
-                    resources["GPU"] = total_gpus
-                    print(f">>> [FAKE GPU PATCH] Injected 'GPU': {total_gpus} in ray._private.state.nodes() for node {node['NodeManagerAddress']}")
-    return nodes
-
-ray_state.nodes = patched_ray_state_nodes
+_original_init_cluster = ray_utils.initialize_ray_cluster
+_original_node_resources = ray_state.node_resources
 
 def patched_available_resources():
     resources = _original_available_resources()
@@ -38,12 +24,6 @@ def patched_available_resources():
             print(f">>> [FAKE GPU PATCH] Injected GPU={fake_gpu} in available_resources()")
     return resources
 
-ray.available_resources = patched_available_resources
-
-# Monkey-patch vLLM's GPU check in initialize_ray_cluster
-from vllm.executor import ray_utils
-_original_init_cluster = ray_utils.initialize_ray_cluster
-
 def patched_initialize_ray_cluster(parallel_config):
     print(">>> [PATCH ACTIVE] Skipping vLLM initialize_ray_cluster GPU check")
     from vllm.executor.parallel_utils import get_parallel_config
@@ -52,11 +32,6 @@ def patched_initialize_ray_cluster(parallel_config):
     ray.init(address="auto", ignore_reinit_error=True)
     parallel_config = get_parallel_config(parallel_config)
     RayExecutor.initialize_parallel_groups(parallel_config)
-
-ray_utils.initialize_ray_cluster = patched_initialize_ray_cluster
-
-import ray._private.state as ray_state
-_original_node_resources = ray_state.node_resources
 
 def patched_node_resources(node_id: Optional[str] = None):
     resources = _original_node_resources(node_id)
@@ -68,12 +43,21 @@ def patched_node_resources(node_id: Optional[str] = None):
             print(f">>> [FAKE GPU PATCH] Injected 'GPU': {fake_gpu} in ray_state.node_resources() for node {node_id}")
     return resources
 
+
+ray.available_resources = patched_available_resources
+ray_utils.initialize_ray_cluster = patched_initialize_ray_cluster
 ray_state.node_resources = patched_node_resources
 
-# Now safe to import rest of vLLM
+import os
+
+from typing import Dict, Optional, List
+import logging
+
 from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import StreamingResponse, JSONResponse
+
+from ray import serve
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -92,6 +76,7 @@ logger = logging.getLogger("ray.serve")
 
 app = FastAPI()
 
+
 @serve.deployment(name="VLLMDeployment")
 @serve.ingress(app)
 class VLLMDeployment:
@@ -104,56 +89,88 @@ class VLLMDeployment:
         request_logger: Optional[RequestLogger] = None,
         chat_template: Optional[str] = None,
     ):
+        logger.info(f"Starting with engine args: {engine_args}")
         self.openai_serving_chat = None
+        self.engine_args = engine_args
         self.response_role = response_role
         self.lora_modules = lora_modules
         self.prompt_adapters = prompt_adapters
         self.request_logger = request_logger
         self.chat_template = chat_template
-
-        # Post-init model init — defer engine until inside __init__
-        self.engine_args = engine_args
-        logger.info(f">>> Initializing AsyncLLMEngine with args: {engine_args}")
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     @app.post("/v1/chat/completions")
-    async def create_chat_completion(self, request: ChatCompletionRequest, raw_request: Request):
+    async def create_chat_completion(
+        self, request: ChatCompletionRequest, raw_request: Request
+    ):
+        """OpenAI-compatible HTTP endpoint.
+
+        API reference:
+            - https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+        """
         if not self.openai_serving_chat:
             model_config = await self.engine.get_model_config()
-            model_names = self.engine_args.served_model_name or [self.engine_args.model]
+            # Determine the name of the served model for the OpenAI client.
+            if self.engine_args.served_model_name is not None:
+                served_model_names = self.engine_args.served_model_name
+            else:
+                served_model_names = [self.engine_args.model]
             self.openai_serving_chat = OpenAIServingChat(
                 self.engine,
                 model_config,
-                model_names,
+                served_model_names,
                 self.response_role,
                 lora_modules=self.lora_modules,
                 prompt_adapters=self.prompt_adapters,
                 request_logger=self.request_logger,
                 chat_template=self.chat_template,
             )
-
-        logger.info(f">>> Chat request: {request}")
-        generator = await self.openai_serving_chat.create_chat_completion(request, raw_request)
+        logger.info(f"Request: {request}")
+        generator = await self.openai_serving_chat.create_chat_completion(
+            request, raw_request
+        )
         if isinstance(generator, ErrorResponse):
-            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+            return JSONResponse(
+                content=generator.model_dump(), status_code=generator.code
+            )
         if request.stream:
-            return StreamingResponse(generator, media_type="text/event-stream")
-        assert isinstance(generator, ChatCompletionResponse)
-        return JSONResponse(content=generator.model_dump())
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+        else:
+            assert isinstance(generator, ChatCompletionResponse)
+            return JSONResponse(content=generator.model_dump())
+
 
 def parse_vllm_args(cli_args: Dict[str, str]):
-    parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible API server")
-    arg_parser = make_arg_parser(parser)
-    args_list = [f"--{k}" if not k.startswith("--") else k for k in cli_args for _ in (0, 1)]
-    for i, k in enumerate(cli_args):
-        args_list[2 * i + 1] = str(cli_args[k])
-    parsed_args = arg_parser.parse_args(args=args_list)
+    """Parses vLLM args based on CLI inputs.
+
+    Currently uses argparse because vLLM doesn't expose Python models for all of the
+    config options we want to support.
+    """
+    arg_parser = FlexibleArgumentParser(
+        description="vLLM OpenAI-Compatible RESTful API server."
+    )
+
+    parser = make_arg_parser(arg_parser)
+    arg_strings = []
+    for key, value in cli_args.items():
+        arg_strings.extend([f"--{key}", str(value)])
+    logger.info(arg_strings)
+    parsed_args = parser.parse_args(args=arg_strings)
     return parsed_args
 
+
 def build_app(cli_args: Dict[str, str]) -> serve.Application:
+    """Builds the Serve app based on CLI arguments.
+
+    See https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#command-line-arguments-for-the-server
+    for the complete set of arguments.
+
+    Supported engine arguments: https://docs.vllm.ai/en/latest/models/engine_args.html.
+    """  # noqa: E501
     parsed_args = parse_vllm_args(cli_args)
     engine_args = AsyncEngineArgs.from_cli_args(parsed_args)
     engine_args.worker_use_ray = True
+
     return VLLMDeployment.bind(
         engine_args,
         parsed_args.response_role,
@@ -163,8 +180,6 @@ def build_app(cli_args: Dict[str, str]) -> serve.Application:
         parsed_args.chat_template,
     )
 
-model = build_app({
-    "model": os.environ["MODEL_ID"],
-    "tensor-parallel-size": os.environ["TENSOR_PARALLELISM"],
-    "pipeline-parallel-size": os.environ["PIPELINE_PARALLELISM"],
-})
+
+model = build_app(
+    {"model": os.environ['MODEL_ID'], "tensor-parallel-size": os.environ['TENSOR_PARALLELISM'], "pipeline-parallel-size": os.environ['PIPELINE_PARALLELISM']})
