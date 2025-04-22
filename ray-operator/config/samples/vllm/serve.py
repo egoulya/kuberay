@@ -9,7 +9,6 @@ from vllm.executor import ray_utils
 
 # Monkey-patch: Make Ray think GPUs exist even if not labeled "GPU"
 _original_available_resources = ray.available_resources
-_original_nodes = ray_state.nodes
 _original_init_cluster = ray_utils.initialize_ray_cluster
 
 try:
